@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -20,6 +21,8 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+
+logger = init_logger(__name__)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -191,6 +194,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if spec_sequence_masks is None:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(m, decode_threshold=1)
+            )
+            # TRACE [GDN split]: GDN Attention Backend 的 decode/prefill 分割。
+            # Qwen3-0.6B 等标准 Transformer 模型走此路径（非 Ascend 原生 Builder）。
+            # decode_threshold=1 表示 query 长度=1 视为 decode，>1 视为 prefill。
+            # 在 chunked prefill 混合 batch 中：
+            #   纯 prefill chunk（如 1024 tokens）：num_decodes=0, num_prefills=1, prefill_tokens=1024
+            #   混合 batch（3 个 decode + 1 个 prefill chunk）：
+            #     num_decodes=3, num_prefills=1, decode_tokens=3, prefill_tokens=512
+            logger.debug(
+                "[CHUNKED_PREFILL_TRACE] GDNAttentionMetadataBuilder.build() | "
+                "num_decodes=%d, num_prefills=%d, "
+                "num_decode_tokens=%d, num_prefill_tokens=%d, "
+                "num_actual_tokens=%d",
+                num_decodes, num_prefills,
+                num_decode_tokens, num_prefill_tokens,
+                m.num_actual_tokens,
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None

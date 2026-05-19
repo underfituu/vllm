@@ -358,6 +358,15 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        # TRACE [entry]: 每个调度步开始时的全局预算和队列状态。
+        # 示例（2980-token 请求首轮）：token_budget=1024, num_running=0, num_waiting=1
+        # max_num_batched_tokens=1024 决定了每步最多处理多少 token，
+        # 这是 chunked prefill 的核心约束：超过此值的 prefill 必须被切分。
+        logger.debug(
+            "[CHUNKED_PREFILL_TRACE] Scheduler.schedule() entry | "
+            "token_budget=%d, num_running=%d, num_waiting=%d",
+            token_budget, len(self.running), len(self.waiting),
+        )
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -398,7 +407,23 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens_before_clamp = num_new_tokens
             num_new_tokens = min(num_new_tokens, token_budget)
+            # TRACE [running]: 对 running 队列中的请求，计算本步需要处理的 token 数，
+            # 并用 min(num_new_tokens, token_budget) 截断。
+            # 示例（2980-token 请求，chunked prefill 续传）：
+            #   第2步: num_computed=1024, num_new_tokens_raw=1956, clamped→1024 (被截断,处理chunk2)
+            #   第3步: num_computed=2048, num_new_tokens_raw=932,  clamped→932  (最后一块<budget,不截断)
+            #   第4步: num_computed=2980, num_new_tokens_raw=1,    clamped→1    (进入decode阶段)
+            # 对于 318-token 短请求，首轮 waiting→running 后，decode 阶段每步 raw=1, clamped=1。
+            logger.debug(
+                "[CHUNKED_PREFILL_TRACE] Scheduler.schedule() running | "
+                "req_id=%s, num_computed=%d, num_tokens=%d, "
+                "num_new_tokens_raw=%d, num_new_tokens_clamped=%d, token_budget_before=%d",
+                request.request_id, request.num_computed_tokens,
+                request.num_tokens_with_spec,
+                num_new_tokens_before_clamp, num_new_tokens, token_budget,
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -667,7 +692,30 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
+                    num_new_tokens_before_clamp_w = num_new_tokens
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    # TRACE [waiting]: 新请求从 waiting 队列进入调度的核心决策点。
+                    # 这里是 chunked prefill 的 "切刀" 位置：
+                    #   enable_chunked_prefill=True 时，num_new_tokens 被 clamp 到 token_budget，
+                    #   请求只处理前 budget 个 token（chunk 1），剩余进入 running 队列下一步续传。
+                    #   enable_chunked_prefill=False 时，超 budget 的请求直接 break，不调度。
+                    # 示例（2980-token 请求，budget=1024）：
+                    #   num_new_tokens_raw=2980, clamped→1024, is_chunked=True
+                    #   → 只处理 token[0:1024]，剩余 1956 token 下一步继续
+                    # 示例（318-token 短请求，budget=1024）：
+                    #   num_new_tokens_raw=318, clamped→318, is_chunked=False
+                    #   → 一次性处理完，不需要切分
+                    logger.debug(
+                        "[CHUNKED_PREFILL_TRACE] Scheduler.schedule() waiting | "
+                        "req_id=%s, num_computed=%d, num_tokens=%d, "
+                        "num_new_tokens_raw=%d, num_new_tokens_clamped=%d, "
+                        "is_chunked=%s, token_budget_before=%d",
+                        request_id, num_computed_tokens,
+                        request.num_tokens,
+                        num_new_tokens_before_clamp_w, num_new_tokens,
+                        num_new_tokens < num_new_tokens_before_clamp_w,
+                        token_budget,
+                    )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
