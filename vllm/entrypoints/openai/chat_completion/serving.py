@@ -73,6 +73,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
+from vllm.v1.core.mamba_mtp_debug import debug_log, serving_debug_enabled
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -261,6 +262,22 @@ class OpenAIServingChat(OpenAIServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
+        if serving_debug_enabled():
+            debug_log(
+                "chat_request_frontend_created",
+                request_id=request_id,
+                client=getattr(raw_request, "client", None),
+                x_request_id=(
+                    raw_request.headers.get("X-Request-Id") if raw_request else None
+                ),
+                stream=request.stream,
+                n=request.n,
+                max_tokens=request.max_tokens,
+                max_completion_tokens=request.max_completion_tokens,
+                request_model=request.model,
+                num_engine_inputs=len(engine_inputs),
+            )
+
         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
         model_name = self.models.model_name(lora_request)
@@ -280,16 +297,30 @@ class OpenAIServingChat(OpenAIServing):
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
 
+            prompt_len = self._extract_prompt_len(engine_input)
             max_tokens = get_max_tokens(
                 max_model_len,
                 request.max_completion_tokens
                 if request.max_completion_tokens is not None
                 else request.max_tokens,
-                self._extract_prompt_len(engine_input),
+                prompt_len,
                 self.default_sampling_params,
                 self.override_max_tokens,
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
+
+            if serving_debug_enabled():
+                debug_log(
+                    "chat_request_engine_input_prepared",
+                    request_id=request_id,
+                    sub_request_id=sub_request_id,
+                    input_index=i,
+                    prompt_len=prompt_len,
+                    prompt_token_ids_tail=(prompt_token_ids[-16:]
+                                           if prompt_token_ids else []),
+                    max_tokens=max_tokens,
+                    stream=request.stream,
+                )
 
             sampling_params: SamplingParams | BeamSearchParams
             if request.use_beam_search:
@@ -338,6 +369,20 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     reasoning_ended = None
 
+                if serving_debug_enabled():
+                    debug_log(
+                        "chat_request_engine_generate_start",
+                        request_id=request_id,
+                        sub_request_id=sub_request_id,
+                        prompt_len=prompt_len,
+                        max_tokens=max_tokens,
+                        temperature=getattr(sampling_params, "temperature", None),
+                        top_p=getattr(sampling_params, "top_p", None),
+                        output_kind=str(getattr(sampling_params, "output_kind", None)),
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
+                        reasoning_ended=reasoning_ended,
+                    )
                 generator = self.engine_client.generate(
                     engine_input,
                     sampling_params,
@@ -496,6 +541,28 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                if serving_debug_enabled():
+                    debug_log(
+                        "chat_stream_engine_output",
+                        request_id=request_id,
+                        engine_request_id=res.request_id,
+                        finished=res.finished,
+                        num_outputs=len(res.outputs),
+                        prompt_tokens=(len(res.prompt_token_ids)
+                                       if res.prompt_token_ids is not None else None),
+                        num_cached_tokens=res.num_cached_tokens,
+                        output_summaries=[
+                            {
+                                "index": output.index,
+                                "finish_reason": output.finish_reason,
+                                "stop_reason": output.stop_reason,
+                                "token_ids_tail": as_list(output.token_ids)[-16:],
+                                "text_tail": output.text[-128:],
+                                "text_repr_tail": repr(output.text[-128:]),
+                            }
+                            for output in res.outputs
+                        ],
+                    )
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -550,6 +617,25 @@ class OpenAIServingChat(OpenAIServing):
                             )
 
                         data = chunk.model_dump_json(exclude_unset=True)
+                        if serving_debug_enabled():
+                            debug_log(
+                                "chat_stream_frontend_chunk",
+                                request_id=request_id,
+                                choice_index=i,
+                                finish_reason=choice_data.finish_reason,
+                                stop_reason=choice_data.stop_reason,
+                                token_ids_tail=(choice_data.token_ids[-16:]
+                                                if choice_data.token_ids else None),
+                                delta_content_tail=(
+                                    choice_data.delta.content[-128:]
+                                    if choice_data.delta.content else None
+                                ),
+                                delta_content_repr_tail=(
+                                    repr(choice_data.delta.content[-128:])
+                                    if choice_data.delta.content else None
+                                ),
+                                data_len=len(data),
+                            )
                         yield f"data: {data}\n\n"
 
                     # Send response to echo the input portion of the
@@ -870,6 +956,25 @@ class OpenAIServingChat(OpenAIServing):
                         )
 
                     data = chunk.model_dump_json(exclude_unset=True)
+                    if serving_debug_enabled():
+                        debug_log(
+                            "chat_stream_frontend_chunk",
+                            request_id=request_id,
+                            choice_index=i,
+                            finish_reason=choice_data.finish_reason,
+                            stop_reason=choice_data.stop_reason,
+                            token_ids_tail=(choice_data.token_ids[-16:]
+                                            if choice_data.token_ids else None),
+                            delta_content_tail=(
+                                choice_data.delta.content[-128:]
+                                if choice_data.delta.content else None
+                            ),
+                            delta_content_repr_tail=(
+                                repr(choice_data.delta.content[-128:])
+                                if choice_data.delta.content else None
+                            ),
+                            data_len=len(data),
+                        )
                     yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage
@@ -952,6 +1057,28 @@ class OpenAIServingChat(OpenAIServing):
         try:
             async for res in result_generator:
                 final_res = res
+                if serving_debug_enabled():
+                    debug_log(
+                        "chat_full_engine_output",
+                        request_id=request_id,
+                        engine_request_id=res.request_id,
+                        finished=res.finished,
+                        num_outputs=len(res.outputs),
+                        prompt_tokens=(len(res.prompt_token_ids)
+                                       if res.prompt_token_ids is not None else None),
+                        num_cached_tokens=res.num_cached_tokens,
+                        output_summaries=[
+                            {
+                                "index": output.index,
+                                "finish_reason": output.finish_reason,
+                                "stop_reason": output.stop_reason,
+                                "token_ids_tail": as_list(output.token_ids)[-16:],
+                                "text_tail": output.text[-128:],
+                                "text_repr_tail": repr(output.text[-128:]),
+                            }
+                            for output in res.outputs
+                        ],
+                    )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
 
@@ -1329,6 +1456,35 @@ class OpenAIServingChat(OpenAIServing):
             prompt_text=prompt_text,
             kv_transfer_params=final_res.kv_transfer_params,
         )
+
+        if serving_debug_enabled():
+            debug_log(
+                "chat_full_frontend_response",
+                request_id=request_id,
+                prompt_tokens=num_prompt_tokens,
+                completion_tokens=num_generated_tokens,
+                num_cached_tokens=final_res.num_cached_tokens,
+                choices=[
+                    {
+                        "index": choice.index,
+                        "finish_reason": choice.finish_reason,
+                        "stop_reason": choice.stop_reason,
+                        "content_tail": (
+                            choice.message.content[-128:]
+                            if choice.message.content else None
+                        ),
+                        "content_repr_tail": (
+                            repr(choice.message.content[-128:])
+                            if choice.message.content else None
+                        ),
+                        "token_ids_tail": (
+                            as_list(final_res.outputs[choice.index].token_ids)[-16:]
+                            if choice.index < len(final_res.outputs) else None
+                        ),
+                    }
+                    for choice in choices
+                ],
+            )
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:

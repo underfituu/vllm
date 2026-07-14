@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 DEBUG_ENV = "VLLM_ASCEND_DEBUG_MAMBA_MTP_BLOCKS"
+SERVING_ENV = "VLLM_ASCEND_DEBUG_SERVING_REQUESTS"
 SAMPLE_ENV = "VLLM_ASCEND_DEBUG_MAMBA_MTP_BLOCKS_SAMPLE"
 LIMIT_ENV = "VLLM_ASCEND_DEBUG_MAMBA_MTP_BLOCKS_LIMIT"
 LOG_PREFIX = "[MAMBA_MTP_BLOCK_DEBUG]"
@@ -21,6 +22,11 @@ LOG_PREFIX = "[MAMBA_MTP_BLOCK_DEBUG]"
 @lru_cache(maxsize=1)
 def debug_enabled() -> bool:
     return os.getenv(DEBUG_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
+@lru_cache(maxsize=1)
+def serving_debug_enabled() -> bool:
+    return os.getenv(SERVING_ENV, "").lower() in {"1", "true", "yes", "on"}
 
 
 @lru_cache(maxsize=1)
