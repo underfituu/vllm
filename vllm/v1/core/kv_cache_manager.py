@@ -11,6 +11,12 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.mamba_mtp_debug import (
+    block_ids_tail,
+    blocks_meta_tail,
+    debug_enabled,
+    debug_log,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -341,6 +347,75 @@ class KVCacheManager:
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
 
+        if debug_enabled() and (
+            num_new_computed_tokens > 0
+            or new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+        ):
+            new_computed_block_lens = [
+                len(blocks) for blocks in new_computed_block_list
+            ]
+            new_computed_block_sizes = [
+                group.kv_cache_spec.block_size
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
+            new_computed_group_cover_lengths = [
+                block_len * block_size
+                for block_len, block_size in zip(
+                    new_computed_block_lens, new_computed_block_sizes
+                )
+            ]
+            min_new_computed_group_cover_length = (
+                min(new_computed_group_cover_lengths)
+                if new_computed_group_cover_lengths
+                else 0
+            )
+            new_computed_coverage_shortfall_by = (
+                num_new_computed_tokens - min_new_computed_group_cover_length
+            )
+            debug_log(
+                "kv_allocate_new_computed_blocks",
+                req_id=request.request_id,
+                num_tokens=request.num_tokens,
+                num_tokens_with_spec=getattr(request, "num_tokens_with_spec", None),
+                num_computed_tokens=request.num_computed_tokens,
+                num_new_tokens=num_new_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                new_computed_block_lens=new_computed_block_lens,
+                new_computed_block_sizes=new_computed_block_sizes,
+                new_computed_group_cover_lengths=new_computed_group_cover_lengths,
+                min_new_computed_group_cover_length=(
+                    min_new_computed_group_cover_length
+                ),
+                new_computed_coverage_shortfall_by=(
+                    new_computed_coverage_shortfall_by
+                ),
+                new_computed_blocks=blocks_meta_tail(new_computed_block_list),
+            )
+            if new_computed_coverage_shortfall_by > 0:
+                debug_log(
+                    "kv_allocate_new_computed_length_mismatch",
+                    req_id=request.request_id,
+                    num_tokens=request.num_tokens,
+                    num_tokens_with_spec=getattr(
+                        request, "num_tokens_with_spec", None
+                    ),
+                    num_computed_tokens=request.num_computed_tokens,
+                    num_new_tokens=num_new_tokens,
+                    num_new_computed_tokens=num_new_computed_tokens,
+                    new_computed_block_lens=new_computed_block_lens,
+                    new_computed_block_sizes=new_computed_block_sizes,
+                    new_computed_group_cover_lengths=(
+                        new_computed_group_cover_lengths
+                    ),
+                    min_new_computed_group_cover_length=(
+                        min_new_computed_group_cover_length
+                    ),
+                    new_computed_coverage_shortfall_by=(
+                        new_computed_coverage_shortfall_by
+                    ),
+                    new_computed_blocks=blocks_meta_tail(new_computed_block_list),
+                )
+
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_local_computed_tokens = (
@@ -364,7 +439,23 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            free_blocks = self.block_pool.get_num_free_blocks()
+            if num_blocks_to_allocate > free_blocks:
+                debug_log(
+                    "kv_allocate_full_sequence_reject",
+                    req_id=request.request_id,
+                    num_tokens=request.num_tokens,
+                    num_computed_tokens=request.num_computed_tokens,
+                    full_num_tokens=full_num_tokens,
+                    num_new_tokens=num_new_tokens,
+                    num_new_computed_tokens=num_new_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                    num_lookahead_tokens=num_lookahead_tokens,
+                    num_blocks_to_allocate=num_blocks_to_allocate,
+                    free_blocks=free_blocks,
+                    reserved_blocks=reserved_blocks,
+                    computed_blocks=blocks_meta_tail(new_computed_block_list),
+                )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -392,9 +483,35 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+        free_blocks = self.block_pool.get_num_free_blocks()
+        available_blocks = free_blocks - reserved_blocks
         if num_blocks_to_allocate > available_blocks:
             # Cannot allocate new blocks
+            debug_log(
+                "kv_allocate_reject",
+                req_id=request.request_id,
+                num_tokens=request.num_tokens,
+                num_tokens_with_spec=getattr(request, "num_tokens_with_spec", None),
+                num_computed_tokens=request.num_computed_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_new_tokens=num_new_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+                num_tokens_need_slot=num_tokens_need_slot,
+                num_lookahead_tokens=num_lookahead_tokens,
+                delay_cache_blocks=delay_cache_blocks,
+                num_blocks_to_allocate=num_blocks_to_allocate,
+                free_blocks=free_blocks,
+                reserved_blocks=reserved_blocks,
+                available_blocks=available_blocks,
+                current_blocks=block_ids_tail(
+                    self.coordinator.get_blocks(request.request_id)
+                )
+                if debug_enabled()
+                else None,
+                computed_blocks=blocks_meta_tail(new_computed_block_list),
+            )
             return None
 
         if (
@@ -415,6 +532,31 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+        )
+
+        debug_log(
+            "kv_allocate_success",
+            req_id=request.request_id,
+            num_tokens=request.num_tokens,
+            num_tokens_with_spec=getattr(request, "num_tokens_with_spec", None),
+            num_computed_tokens=request.num_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_new_tokens=num_new_tokens,
+            num_new_computed_tokens=num_new_computed_tokens,
+            num_external_computed_tokens=num_external_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            num_tokens_need_slot=num_tokens_need_slot,
+            num_lookahead_tokens=num_lookahead_tokens,
+            delay_cache_blocks=delay_cache_blocks,
+            num_blocks_to_allocate=num_blocks_to_allocate,
+            free_blocks_before=free_blocks,
+            free_blocks_after=self.block_pool.get_num_free_blocks(),
+            new_blocks=blocks_meta_tail(new_blocks),
+            current_blocks=block_ids_tail(
+                self.coordinator.get_blocks(request.request_id)
+            )
+            if debug_enabled()
+            else None,
         )
 
         # P/D: delay caching blocks if we have to recv from
@@ -443,7 +585,30 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        blocks_before_free = (
+            self.coordinator.get_blocks(request.request_id)
+            if debug_enabled()
+            else None
+        )
+        free_blocks_before = self.block_pool.get_num_free_blocks()
+        debug_log(
+            "kv_free_request",
+            req_id=request.request_id,
+            status=str(request.status),
+            num_tokens=request.num_tokens,
+            num_tokens_with_spec=getattr(request, "num_tokens_with_spec", None),
+            num_computed_tokens=request.num_computed_tokens,
+            num_output_placeholders=getattr(request, "num_output_placeholders", None),
+            blocks=blocks_meta_tail(blocks_before_free),
+            free_blocks_before=free_blocks_before,
+        )
         self.coordinator.free(request.request_id)
+        debug_log(
+            "kv_free_request_done",
+            req_id=request.request_id,
+            free_blocks_before=free_blocks_before,
+            free_blocks_after=self.block_pool.get_num_free_blocks(),
+        )
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
@@ -559,6 +724,18 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
+            debug_log(
+                "kv_cache_blocks",
+                req_id=request.request_id,
+                num_computed_tokens=num_computed_tokens,
+                num_tokens=request.num_tokens,
+                num_tokens_with_spec=getattr(request, "num_tokens_with_spec", None),
+                current_blocks=blocks_meta_tail(
+                    self.coordinator.get_blocks(request.request_id)
+                )
+                if debug_enabled()
+                else None,
+            )
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
