@@ -347,6 +347,75 @@ class KVCacheManager:
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
 
+        if debug_enabled() and (
+            num_new_computed_tokens > 0
+            or new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+        ):
+            new_computed_block_lens = [
+                len(blocks) for blocks in new_computed_block_list
+            ]
+            new_computed_block_sizes = [
+                group.kv_cache_spec.block_size
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
+            new_computed_group_cover_lengths = [
+                block_len * block_size
+                for block_len, block_size in zip(
+                    new_computed_block_lens, new_computed_block_sizes
+                )
+            ]
+            min_new_computed_group_cover_length = (
+                min(new_computed_group_cover_lengths)
+                if new_computed_group_cover_lengths
+                else 0
+            )
+            new_computed_coverage_shortfall_by = (
+                num_new_computed_tokens - min_new_computed_group_cover_length
+            )
+            debug_log(
+                "kv_allocate_new_computed_blocks",
+                req_id=request.request_id,
+                num_tokens=request.num_tokens,
+                num_tokens_with_spec=getattr(request, "num_tokens_with_spec", None),
+                num_computed_tokens=request.num_computed_tokens,
+                num_new_tokens=num_new_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                new_computed_block_lens=new_computed_block_lens,
+                new_computed_block_sizes=new_computed_block_sizes,
+                new_computed_group_cover_lengths=new_computed_group_cover_lengths,
+                min_new_computed_group_cover_length=(
+                    min_new_computed_group_cover_length
+                ),
+                new_computed_coverage_shortfall_by=(
+                    new_computed_coverage_shortfall_by
+                ),
+                new_computed_blocks=blocks_meta_tail(new_computed_block_list),
+            )
+            if new_computed_coverage_shortfall_by > 0:
+                debug_log(
+                    "kv_allocate_new_computed_length_mismatch",
+                    req_id=request.request_id,
+                    num_tokens=request.num_tokens,
+                    num_tokens_with_spec=getattr(
+                        request, "num_tokens_with_spec", None
+                    ),
+                    num_computed_tokens=request.num_computed_tokens,
+                    num_new_tokens=num_new_tokens,
+                    num_new_computed_tokens=num_new_computed_tokens,
+                    new_computed_block_lens=new_computed_block_lens,
+                    new_computed_block_sizes=new_computed_block_sizes,
+                    new_computed_group_cover_lengths=(
+                        new_computed_group_cover_lengths
+                    ),
+                    min_new_computed_group_cover_length=(
+                        min_new_computed_group_cover_length
+                    ),
+                    new_computed_coverage_shortfall_by=(
+                        new_computed_coverage_shortfall_by
+                    ),
+                    new_computed_blocks=blocks_meta_tail(new_computed_block_list),
+                )
+
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_local_computed_tokens = (
